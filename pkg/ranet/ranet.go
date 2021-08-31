@@ -1,10 +1,8 @@
 package main
 
 import (
-	"flag"
-	"log"
-
-	"gitlab.com/NickCao/RAIT/v4/pkg/rait"
+	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
@@ -15,21 +13,11 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"log"
 	"os"
 )
 
-var config = flag.String("c", "/etc/rait/rait.conf", "path to config")
-
 func main() {
-	flag.Parse()
-	r, err := rait.NewRAIT(*config)
-	if err != nil {
-		log.Fatal(err)
-	}
-	peers, err := r.Listing()
-	if err != nil {
-		log.Fatal(err)
-	}
 	stk := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol, ipv6.NewProtocol,
@@ -40,13 +28,12 @@ func main() {
 		},
 		HandleLocal: true,
 	})
-	for id := range peers {
-		wg := NewWireguard(1500)
-		err := stk.CreateNIC(tcpip.NICID(id), (*WireguardEndpoint)(wg))
-		if err != nil {
-			log.Fatal(err)
-		}
+	wg := NewWireguard(1500)
+	err := stk.CreateNIC(tcpip.NICID(1), (*WireguardEndpoint)(wg))
+	if err != nil {
+		log.Fatal(err)
 	}
+	_ = device.NewDevice((*WireguardDevice)(wg), conn.NewDefaultBind(), device.NewLogger(device.LogLevelVerbose, ""))
 }
 
 type Wireguard struct {
@@ -69,13 +56,29 @@ type WireguardDevice Wireguard
 func (w *WireguardDevice) File() *os.File {
 	return nil
 }
-func (w *WireguardDevice) Read([]byte, int) (int, error) {
-	return 0, nil
+func (w *WireguardDevice) Read(buf []byte, off int) (int, error) {
+	view, ok := <-w.buf
+	if !ok {
+		return 0, os.ErrClosed
+	}
+	return view.Read(buf[off:])
 }
 
-func (w *WireguardDevice) Write([]byte, int) (int, error) {
-	return 0, nil
+func (w *WireguardDevice) Write(buf []byte, off int) (int, error) {
+	pkt := buf[off:]
+	if len(pkt) == 0 {
+		return 0, nil
+	}
+	pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Data: buffer.NewVectorisedView(len(pkt), []buffer.View{buffer.NewViewFromBytes(pkt)})})
+	switch pkt[0] >> 4 {
+	case 4:
+		w.dispatcher.DeliverNetworkPacket("", "", ipv4.ProtocolNumber, pkb)
+	case 6:
+		w.dispatcher.DeliverNetworkPacket("", "", ipv6.ProtocolNumber, pkb)
+	}
+	return len(buf), nil
 }
+
 func (w *WireguardDevice) Flush() error {
 	return nil
 }
@@ -129,12 +132,21 @@ func (w *WireguardEndpoint) AddHeader(local, remote tcpip.LinkAddress, protocol 
 }
 
 func (w *WireguardEndpoint) WritePacket(_ stack.RouteInfo, _ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
-	w.buf <- buffer.NewVectorisedView(pkt.Size(), pkt.Views())
-	return nil
+	return w.WriteRawPacket(pkt)
 }
 
 func (w *WireguardEndpoint) WritePackets(ri stack.RouteInfo, pkts stack.PacketBufferList, pn tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
-	panic("not implemented")
+	curr := pkts.Front()
+	count := 0
+	for curr != nil {
+		err := w.WritePacket(ri, pn, curr)
+		if err != nil {
+			return count, err
+		}
+		count++
+		curr = curr.Next()
+	}
+	return count, nil
 }
 
 func (w *WireguardEndpoint) WriteRawPacket(pkt *stack.PacketBuffer) tcpip.Error {
